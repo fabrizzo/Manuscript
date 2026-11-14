@@ -28,6 +28,8 @@ export type BookReader = {
     file_url: string;
     total_pages: number | null;
     current_page: number;
+    text_status?: 'ready' | 'empty' | 'failed' | 'pending';
+    snippets_count?: number;
 };
 
 export type Bookmark = {

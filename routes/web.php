@@ -3,6 +3,7 @@
 use App\Http\Controllers\BookController;
 use App\Http\Controllers\BookmarkController;
 use App\Http\Controllers\NoteController;
+use App\Http\Controllers\ReferenceController;
 use Illuminate\Support\Facades\Route;
 
 Route::get('/', fn () => redirect()->route('books.index'))->name('home');
@@ -26,6 +27,13 @@ Route::middleware(['auth'])->group(function () {
     Route::post('books/{book}/notes', [NoteController::class, 'store'])->name('notes.store');
     Route::patch('books/{book}/notes/{note}', [NoteController::class, 'update'])->name('notes.update');
     Route::delete('books/{book}/notes/{note}', [NoteController::class, 'destroy'])->name('notes.destroy');
+
+    // Справочник команд и кода
+    Route::get('reference', [ReferenceController::class, 'index'])->name('reference.index');
+    Route::get('books/{book}/reference', [ReferenceController::class, 'show'])->name('books.reference');
+    Route::post('books/{book}/reference', [ReferenceController::class, 'store'])->name('books.reference.store');
+    Route::delete('books/{book}/reference/snippets/{snippet}', [ReferenceController::class, 'destroySnippet'])->name('books.reference.snippet.destroy');
+    Route::delete('books/{book}/reference', [ReferenceController::class, 'destroy'])->name('books.reference.destroy');
 });
 
 require __DIR__.'/settings.php';

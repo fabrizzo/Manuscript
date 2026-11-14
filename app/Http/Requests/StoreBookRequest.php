@@ -25,6 +25,8 @@ class StoreBookRequest extends FormRequest
                 'max:102400',
             ],
             'pdf_metadata' => ['nullable', 'string'],
+            'snippets' => ['nullable', 'string'],
+            'text_status' => ['nullable', 'in:ready,empty,failed,pending'],
         ];
     }
 

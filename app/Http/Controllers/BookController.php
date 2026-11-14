@@ -6,6 +6,7 @@ use App\Http\Requests\StoreBookRequest;
 use App\Http\Requests\UpdateBookRequest;
 use App\Models\Book;
 use App\Models\Category;
+use App\Services\BookTextService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response as HttpResponse;
@@ -125,7 +126,7 @@ public function create(): Response
     /**
      * Сохранить загруженную книгу.
      */
-   public function store(StoreBookRequest $request): RedirectResponse
+   public function store(StoreBookRequest $request, BookTextService $textService): RedirectResponse
     {
         $file = $request->file('file');
         $path = $file->store('books', 'public');
@@ -156,6 +157,17 @@ public function create(): Response
             'pdf_metadata' => $pdfMetadata,
             'total_pages' => null,
         ]);
+
+        $textStatus = (string) $request->input('text_status', 'pending');
+        $snippetsRaw = $request->input('snippets');
+
+        if (is_string($snippetsRaw) && $snippetsRaw !== '') {
+            $snippets = json_decode($snippetsRaw, true);
+
+            if (is_array($snippets) && in_array($textStatus, ['ready', 'empty', 'failed'], true)) {
+                $textService->sync($book, $snippets, $textStatus);
+            }
+        }
 
         return redirect()
             ->route('books.show', $book)
@@ -234,6 +246,8 @@ public function create(): Response
                 'file_url' => Storage::disk('public')->url($book->file_path),
                 'total_pages' => $book->total_pages,
                 'current_page' => $book->progress?->current_page ?? 1,
+                'text_status' => $book->text_status ?? 'pending',
+                'snippets_count' => $book->snippets_count ?? 0,
             ],
             'initialPage' => $initialPage,
             'bookmarks' => $book->bookmarks()->get(['id', 'page', 'label']),

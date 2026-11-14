@@ -5,6 +5,7 @@ import {
     BookmarkPlus,
     ChevronLeft,
     ChevronRight,
+    Code2,
     ListTree,
     Maximize2,
     Minimize2,
@@ -14,6 +15,7 @@ import {
     PanelRightClose,
     PanelRightOpen,
     Plus,
+    Quote,
     Trash2,
     ZoomIn,
     ZoomOut,
@@ -40,7 +42,7 @@ import {
     type ReaderTheme,
 } from '@/hooks/use-reader-theme';
 import type { BookReader, Bookmark } from '@/types/book';
-import type { Note } from '@/types/note';
+import type { Note, NoteKind } from '@/types/note';
 import { progress as progressRoute } from '@/routes/books';
 import {
     store as bookmarkStore,
@@ -186,6 +188,8 @@ export default function BooksReader({
 }: Props) {
     const startPage = Math.max(1, initialPage || book?.current_page || 1);
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const textLayerRef = useRef<HTMLDivElement>(null);
+    const textLayerTaskRef = useRef<any>(null);
     const viewerRef = useRef<HTMLDivElement>(null);
     const pdfDocRef = useRef<any>(null);
     const renderTaskRef = useRef<any>(null);
@@ -225,6 +229,11 @@ export default function BooksReader({
     );
     const [noteComposerOpen, setNoteComposerOpen] = useState(false);
     const [editingNote, setEditingNote] = useState<Note | null>(null);
+    const [noteDraft, setNoteDraft] = useState<{
+        kind: NoteKind;
+        body: string;
+    } | null>(null);
+    const [selectedQuote, setSelectedQuote] = useState<string | null>(null);
 
     const currentBookmark = bookmarks.find((b) => b.page === currentPage);
 
@@ -427,6 +436,36 @@ export default function BooksReader({
                 });
                 renderTaskRef.current = task;
                 await task.promise;
+
+                if (renderId !== renderIdRef.current) return;
+
+                // Прозрачный текстовый слой поверх canvas: выделение,
+                // копирование и будущие цитаты.
+                const textLayer = textLayerRef.current;
+                if (textLayer) {
+                    try {
+                        textLayerTaskRef.current?.cancel?.();
+                    } catch {
+                        // ignore
+                    }
+
+                    textLayer.innerHTML = '';
+
+                    const cssViewport = page.getViewport({
+                        scale: effectiveScale,
+                    });
+                    const textContent = await page.getTextContent();
+
+                    if (renderId !== renderIdRef.current) return;
+
+                    const textLayerTask = new (pdfjsLib as any).TextLayer({
+                        textContentSource: textContent,
+                        container: textLayer,
+                        viewport: cssViewport,
+                    });
+                    textLayerTaskRef.current = textLayerTask;
+                    await textLayerTask.render();
+                }
             } catch (e: any) {
                 if (e?.name !== 'RenderingCancelledException') {
                     console.error('Render error:', e);
@@ -616,6 +655,8 @@ export default function BooksReader({
     }, []);
 
     const goToPage = (n: number) => {
+        window.getSelection()?.removeAllRanges();
+        setSelectedQuote(null);
         const clamped = Math.min(Math.max(1, n), totalPages || 1);
         setCurrentPage(clamped);
     };
@@ -691,10 +732,21 @@ export default function BooksReader({
 
     const openNoteComposer = useCallback(() => {
         setEditingNote(null);
+        setNoteDraft(null);
         setPanelTab('notes');
         setPanelOpen(true);
         setNoteComposerOpen(true);
     }, []);
+
+    const openQuoteComposer = (text: string) => {
+        window.getSelection()?.removeAllRanges();
+        setSelectedQuote(null);
+        setEditingNote(null);
+        setNoteDraft({ kind: 'quote', body: text });
+        setPanelTab('notes');
+        setPanelOpen(true);
+        setNoteComposerOpen(true);
+    };
 
     const editNote = (note: Note) => {
         setEditingNote(note);
@@ -715,6 +767,7 @@ export default function BooksReader({
             );
         });
         setEditingNote(null);
+        setNoteDraft(null);
     };
 
     const deleteNote = async (note: Note) => {
@@ -786,6 +839,60 @@ export default function BooksReader({
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
     }, [noteComposerOpen, openNoteComposer]);
+
+    // Выделение текста в PDF → кнопка «В заметку».
+    useEffect(() => {
+        const el = viewerRef.current;
+        if (!el) return;
+
+        const captureSelection = () => {
+            window.setTimeout(() => {
+                const selection = window.getSelection();
+
+                if (
+                    !selection ||
+                    selection.isCollapsed ||
+                    selection.rangeCount === 0
+                ) {
+                    setSelectedQuote(null);
+                    return;
+                }
+
+                const range = selection.getRangeAt(0);
+                if (!el.contains(range.commonAncestorContainer)) {
+                    setSelectedQuote(null);
+                    return;
+                }
+
+                const text = selection.toString().trim();
+                setSelectedQuote(text.length >= 2 ? text.slice(0, 2000) : null);
+            }, 0);
+        };
+
+        const onSelectionChange = () => {
+            const selection = window.getSelection();
+            if (
+                !selection ||
+                selection.isCollapsed ||
+                !selection.toString().trim()
+            ) {
+                setSelectedQuote(null);
+            }
+        };
+
+        el.addEventListener('mouseup', captureSelection);
+        el.addEventListener('touchend', captureSelection);
+        document.addEventListener('selectionchange', onSelectionChange);
+
+        return () => {
+            el.removeEventListener('mouseup', captureSelection);
+            el.removeEventListener('touchend', captureSelection);
+            document.removeEventListener(
+                'selectionchange',
+                onSelectionChange,
+            );
+        };
+    }, []);
 
     if (!book) {
         return (
@@ -969,6 +1076,26 @@ export default function BooksReader({
                     </Button>
 
                     <Button
+                        variant="outline"
+                        size="sm"
+                        className={toolbarSmBtn}
+                        asChild
+                        title="Справочник команд и кода"
+                    >
+                        <Link href={`/books/${book.id}/reference`}>
+                            <Code2 className={`${toolbarIcon} sm:mr-1`} />
+                            <span className="hidden sm:inline">
+                                Справочник
+                            </span>
+                            {(book.snippets_count ?? 0) > 0 && (
+                                <span className="ml-1 hidden rounded-full bg-muted px-1.5 text-[10px] text-foreground sm:inline">
+                                    {book.snippets_count}
+                                </span>
+                            )}
+                        </Link>
+                    </Button>
+
+                    <Button
                         variant={
                             panelOpen && panelTab === 'toc'
                                 ? 'default'
@@ -1134,15 +1261,23 @@ export default function BooksReader({
                                 </div>
                             ) : (
                                 <div className="flex w-max min-w-full justify-center">
-                                    <canvas
-                                        ref={canvasRef}
-                                        className={`rounded border bg-white shadow-lg ${readerThemes[theme].canvasBorder}`}
+                                    <div
+                                        className={`relative inline-block overflow-hidden rounded border bg-white shadow-lg ${readerThemes[theme].canvasBorder}`}
                                         style={{
                                             display: isLoading
                                                 ? 'none'
                                                 : 'block',
                                         }}
-                                    />
+                                    >
+                                        <canvas
+                                            ref={canvasRef}
+                                            className="block"
+                                        />
+                                        <div
+                                            ref={textLayerRef}
+                                            className="textLayer"
+                                        />
+                                    </div>
                                 </div>
                             )}
 
@@ -1152,6 +1287,20 @@ export default function BooksReader({
                                 </div>
                             )}
                         </div>
+
+                        {selectedQuote && !noteComposerOpen && (
+                            <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-4">
+                                <Button
+                                    className="pointer-events-auto shadow-lg"
+                                    onClick={() =>
+                                        openQuoteComposer(selectedQuote)
+                                    }
+                                >
+                                    <Quote className="mr-1.5 h-4 w-4" />
+                                    В заметку
+                                </Button>
+                            </div>
+                        )}
                     </div>
 
                     {/* Правая панель с закладками */}
@@ -1440,7 +1589,10 @@ export default function BooksReader({
                 open={noteComposerOpen}
                 onOpenChange={(open) => {
                     setNoteComposerOpen(open);
-                    if (!open) setEditingNote(null);
+                    if (!open) {
+                        setEditingNote(null);
+                        setNoteDraft(null);
+                    }
                 }}
                 bookId={book.id}
                 bookTitle={book.title}
@@ -1448,6 +1600,8 @@ export default function BooksReader({
                 section={currentSection}
                 suggestedTags={tagSuggestions}
                 note={editingNote}
+                initialKind={noteDraft?.kind}
+                initialBody={noteDraft?.body}
                 onSaved={handleNoteSaved}
             />
         </>

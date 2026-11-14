@@ -22,10 +22,15 @@ class Book extends Model
     'file_size',        // ← добавили
     'pdf_metadata',     // ← добавили
     'total_pages',
+    'text_status',
+    'text_indexed_at',
+    'snippets_count',
     ];
 
     protected $casts = [
     'pdf_metadata' => 'array',
+    'text_indexed_at' => 'datetime',
+    'snippets_count' => 'integer',
     ];
 
     public function user(): BelongsTo
@@ -43,6 +48,13 @@ class Book extends Model
         return $this->hasMany(Note::class)
             ->orderBy('page')
             ->orderByDesc('created_at');
+    }
+
+    public function snippets(): HasMany
+    {
+        return $this->hasMany(BookSnippet::class)
+            ->orderBy('page')
+            ->orderBy('id');
     }
 
     public function progress(): HasOne

@@ -1,5 +1,5 @@
 import { Link } from '@inertiajs/react';
-import { LayoutGrid, NotebookPen } from 'lucide-react';
+import { LayoutGrid, Layers, NotebookPen } from 'lucide-react';
 import AppLogo from '@/components/app-logo';
 import { NavMain } from '@/components/nav-main';
 import { NavUser } from '@/components/nav-user';
@@ -26,6 +26,11 @@ const mainNavItems: NavItem[] = [
         title: 'Заметки',
         href: '/notes',
         icon: NotebookPen,
+    },
+    {
+        title: 'Справочник',
+        href: '/reference',
+        icon: Layers,
     },
 ];
 

@@ -22,6 +22,8 @@ type Props = {
     section: string | null;
     suggestedTags: string[];
     note?: Note | null;
+    initialKind?: NoteKind;
+    initialBody?: string;
     onSaved: (note: Note) => void;
 };
 
@@ -41,6 +43,8 @@ export function NoteComposer({
     section,
     suggestedTags,
     note,
+    initialKind,
+    initialBody,
     onSaved,
 }: Props) {
     const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -58,8 +62,8 @@ export function NoteComposer({
     useEffect(() => {
         if (!open) return;
 
-        setKind(note?.kind ?? 'idea');
-        setBody(note?.body ?? '');
+        setKind(note?.kind ?? initialKind ?? 'idea');
+        setBody(note?.body ?? initialBody ?? '');
         setTags(note?.tags ?? []);
         setTagInput('');
         setError(null);
@@ -71,7 +75,7 @@ export function NoteComposer({
         }, 60);
 
         return () => window.clearTimeout(timer);
-    }, [open, note]);
+    }, [open, note, initialKind, initialBody]);
 
     useEffect(() => {
         const el = textareaRef.current;

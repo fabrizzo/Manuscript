@@ -1,10 +1,19 @@
 import { Form, Head, Link } from '@inertiajs/react';
 import { Wand2 } from 'lucide-react';
 import { transliterateToCyrillic } from '@/lib/transliterate';
-import { ArrowLeft, ChevronLeft, ChevronRight, ImageIcon } from 'lucide-react';
-import { useRef, useState } from 'react';
+import {
+    AlertTriangle,
+    ArrowLeft,
+    CheckCircle2,
+    ChevronLeft,
+    ChevronRight,
+    ImageIcon,
+    ScanLine,
+} from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { extractBookSnippets } from '@/lib/pdf-snippets';
 import InputError from '@/components/input-error';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -18,6 +27,7 @@ import {
 } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { store } from '@/routes/books';
+import type { SnippetDraft, TextStatus } from '@/types/reference';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -45,10 +55,29 @@ export default function BooksCreate({ categories }: Props) {
     const [coverPage, setCoverPage] = useState<number>(1);
     const [totalPages, setTotalPages] = useState<number>(0);
     const [categoryId, setCategoryId] = useState<string>('');
+    const [textStatus, setTextStatus] = useState<TextStatus | 'extracting'>(
+        'pending',
+    );
+    const [textProgress, setTextProgress] = useState({
+        page: 0,
+        total: 0,
+        snippets: 0,
+    });
+    const [snippets, setSnippets] = useState<SnippetDraft[]>([]);
 
     const pdfDocRef = useRef<any>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const coverCanvasRef = useRef<HTMLCanvasElement>(null);
+    const extractionIdRef = useRef(0);
+
+    const snippetsJson = useMemo(() => JSON.stringify(snippets), [snippets]);
+
+    useEffect(
+        () => () => {
+            extractionIdRef.current++;
+        },
+        [],
+    );
 
     /**
      * Рендерит указанную страницу PDF в canvas и возвращает JPEG dataURL.
@@ -90,6 +119,11 @@ export default function BooksCreate({ categories }: Props) {
      * При выборе PDF — загружаем документ и сразу рендерим страницу 1.
      */
     const onFileChange = async (file: File | undefined) => {
+        const extractionId = ++extractionIdRef.current;
+        setSnippets([]);
+        setTextStatus('pending');
+        setTextProgress({ page: 0, total: 0, snippets: 0 });
+
         if (!file) {
             pdfDocRef.current = null;
             setCoverDataUrl(null);
@@ -116,10 +150,37 @@ export default function BooksCreate({ categories }: Props) {
             setTotalPages(pdf.numPages);
             setCoverPage(1);
             await renderCoverPage(1);
+
+            if (extractionIdRef.current !== extractionId) return;
+
+            setTextStatus('extracting');
+            setTextProgress({
+                page: 0,
+                total: pdf.numPages,
+                snippets: 0,
+            });
+
+            const result = await extractBookSnippets(
+                pdf,
+                (progress) => {
+                    if (extractionIdRef.current === extractionId) {
+                        setTextProgress(progress);
+                    }
+                },
+                () => extractionIdRef.current !== extractionId,
+            );
+
+            if (!result || extractionIdRef.current !== extractionId) return;
+
+            setSnippets(result.snippets);
+            setTextStatus(result.textStatus);
         } catch (e) {
             console.error('PDF load error:', e);
             pdfDocRef.current = null;
             setCoverLoading(false);
+            if (extractionIdRef.current === extractionId) {
+                setTextStatus('failed');
+            }
         }
     };
 
@@ -280,6 +341,94 @@ export default function BooksCreate({ categories }: Props) {
                                 </div>
                             )}
 
+                            {/* Статус извлечения текста и справочника */}
+                            {textStatus !== 'pending' && (
+                                <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm">
+                                    {textStatus === 'extracting' && (
+                                        <div className="space-y-2">
+                                            <div className="flex items-center gap-2 font-medium">
+                                                <Spinner className="h-4 w-4" />
+                                                Извлекаю текст и команды…
+                                                <span className="ml-auto text-xs text-muted-foreground">
+                                                    {textProgress.page} /{' '}
+                                                    {textProgress.total || '…'}
+                                                </span>
+                                            </div>
+                                            <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                                                <div
+                                                    className="h-full bg-primary transition-all"
+                                                    style={{
+                                                        width: `${
+                                                            textProgress.total
+                                                                ? Math.round(
+                                                                      (textProgress.page /
+                                                                          textProgress.total) *
+                                                                          100,
+                                                                  )
+                                                                : 0
+                                                        }%`,
+                                                    }}
+                                                />
+                                            </div>
+                                            <p className="text-xs text-muted-foreground">
+                                                Найдено фрагментов:{' '}
+                                                {textProgress.snippets}
+                                            </p>
+                                        </div>
+                                    )}
+
+                                    {textStatus === 'ready' && (
+                                        <div className="flex items-start gap-2">
+                                            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                                            <div>
+                                                <p className="font-medium">
+                                                    Текст распознан
+                                                </p>
+                                                <p className="text-xs text-muted-foreground">
+                                                    Команд и фрагментов кода:{' '}
+                                                    {snippets.length}. Справочник
+                                                    появится у книги после
+                                                    загрузки.
+                                                </p>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {textStatus === 'empty' && (
+                                        <div className="flex items-start gap-2">
+                                            <ScanLine className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+                                            <div>
+                                                <p className="font-medium">
+                                                    Похоже, это скан
+                                                </p>
+                                                <p className="text-xs text-muted-foreground">
+                                                    В PDF нет текстового слоя.
+                                                    Книга загрузится, но
+                                                    справочник собрать не
+                                                    получится.
+                                                </p>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {textStatus === 'failed' && (
+                                        <div className="flex items-start gap-2">
+                                            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+                                            <div>
+                                                <p className="font-medium">
+                                                    Не удалось извлечь текст
+                                                </p>
+                                                <p className="text-xs text-muted-foreground">
+                                                    Книга загрузится. Справочник
+                                                    можно попробовать собрать
+                                                    позже со страницы книги.
+                                                </p>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
                             <div className="grid gap-2">
                                 <Label htmlFor="category_id">Категория</Label>
                                 <Select value={categoryId} onValueChange={setCategoryId}>
@@ -346,13 +495,40 @@ export default function BooksCreate({ categories }: Props) {
                                 value={categoryId}
                             />
 
+                            {/* Скрытые поля извлечённого текста */}
+                            <input
+                                type="hidden"
+                                name="snippets"
+                                value={snippetsJson}
+                            />
+                            <input
+                                type="hidden"
+                                name="text_status"
+                                value={
+                                    textStatus === 'extracting'
+                                        ? 'pending'
+                                        : textStatus
+                                }
+                            />
+
                             {/* Скрытый canvas для рендера — не видно пользователю */}
                             <canvas ref={coverCanvasRef} className="hidden" />
 
                             <div className="flex gap-3">
-                                <Button type="submit" disabled={processing}>
-                                    {processing && <Spinner />}
-                                    Загрузить
+                                <Button
+                                    type="submit"
+                                    disabled={
+                                        processing ||
+                                        textStatus === 'extracting'
+                                    }
+                                >
+                                    {(processing ||
+                                        textStatus === 'extracting') && (
+                                        <Spinner />
+                                    )}
+                                    {textStatus === 'extracting'
+                                        ? 'Готовлю справочник…'
+                                        : 'Загрузить'}
                                 </Button>
                                 <Button variant="outline" asChild>
                                     <Link href="/books">Отмена</Link>
