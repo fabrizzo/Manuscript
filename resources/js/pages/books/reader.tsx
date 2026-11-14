@@ -5,8 +5,10 @@ import {
     BookmarkPlus,
     ChevronLeft,
     ChevronRight,
+    ListTree,
     Maximize2,
     Minimize2,
+    MoveHorizontal,
     Palette,
     PanelRightClose,
     PanelRightOpen,
@@ -46,10 +48,131 @@ type Props = {
     bookmarks: Bookmark[];
 };
 
+type TocEntry = {
+    title: string;
+    page: number | null;
+    children: TocEntry[];
+};
+
+const clamp = (value: number, min: number, max: number) =>
+    Math.min(Math.max(value, min), max);
+
+const MIN_SCALE = 0.2;
+const MAX_SCALE = 4;
+const DEFAULT_SCALE = 1.4;
+
+/**
+ * На ПК по умолчанию читаем в ручном масштабе (140 %), на телефонах
+ * и планшетах — вписываем страницу по ширине.
+ */
+const shouldAutoFit = () =>
+    typeof window !== 'undefined' &&
+    !window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+
+/**
+ * Превращает пункт PDF-оглавления в номер страницы.
+ * pdf.js умеет хранить назначение либо готовым массивом, либо строкой-именем.
+ */
+async function resolveDestinationPage(
+    pdf: any,
+    destination: any,
+): Promise<number | null> {
+    try {
+        const dest =
+            typeof destination === 'string'
+                ? await pdf.getDestination(destination)
+                : destination;
+
+        if (!Array.isArray(dest) || dest.length === 0) return null;
+
+        const ref = dest[0];
+        if (typeof ref === 'number') return ref + 1;
+
+        const pageIndex = await pdf.getPageIndex(ref);
+        return pageIndex + 1;
+    } catch {
+        return null;
+    }
+}
+
+/** Рекурсивно строит дерево оглавления, подставляя номера страниц. */
+async function buildToc(
+    pdf: any,
+    items: any[],
+    depth = 0,
+): Promise<TocEntry[]> {
+    if (!Array.isArray(items) || items.length === 0 || depth > 8) return [];
+
+    return Promise.all(
+        items.map(async (item) => ({
+            title: String(item?.title ?? 'Без названия').trim(),
+            page: await resolveDestinationPage(pdf, item?.dest),
+            children: await buildToc(pdf, item?.items, depth + 1),
+        })),
+    );
+}
+
+function TocList({
+    entries,
+    currentPage,
+    onSelect,
+    depth = 0,
+}: {
+    entries: TocEntry[];
+    currentPage: number;
+    onSelect: (page: number) => void;
+    depth?: number;
+}) {
+    return (
+        <ul className={depth > 0 ? 'ml-2 border-l border-border pl-1' : ''}>
+            {entries.map((entry, index) => {
+                const isActive = entry.page === currentPage;
+
+                return (
+                    <li key={`${depth}-${index}-${entry.title}`}>
+                        <button
+                            type="button"
+                            onClick={() => entry.page && onSelect(entry.page)}
+                            disabled={!entry.page}
+                            className={`flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-xs transition-colors ${
+                                isActive
+                                    ? 'bg-accent font-medium text-accent-foreground'
+                                    : 'hover:bg-accent/60'
+                            } ${entry.page ? '' : 'cursor-default opacity-60'}`}
+                        >
+                            <span className="min-w-0 flex-1 leading-snug">
+                                {entry.title}
+                            </span>
+                            {entry.page && (
+                                <span className="shrink-0 tabular-nums text-[10px] text-muted-foreground">
+                                    {entry.page}
+                                </span>
+                            )}
+                        </button>
+                        {entry.children.length > 0 && (
+                            <TocList
+                                entries={entry.children}
+                                currentPage={currentPage}
+                                onSelect={onSelect}
+                                depth={depth + 1}
+                            />
+                        )}
+                    </li>
+                );
+            })}
+        </ul>
+    );
+}
+
 export default function BooksReader({ book, bookmarks }: Props) {
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const viewerRef = useRef<HTMLDivElement>(null);
     const pdfDocRef = useRef<any>(null);
     const renderTaskRef = useRef<any>(null);
+    const renderIdRef = useRef(0);
+    const effectiveScaleRef = useRef(1.4);
+    const currentPageRef = useRef<number>(book?.current_page || 1);
+    const lastSavedRef = useRef<number>(book?.current_page || 0);
     const touchStateRef = useRef<{
         startDist: number;
         startScale: number;
@@ -62,7 +185,10 @@ export default function BooksReader({ book, bookmarks }: Props) {
         book?.current_page || 1,
     );
     const { theme, setTheme } = useReaderTheme();
-    const [scale, setScale] = useState<number>(1.4);
+    const [scale, setScale] = useState<number>(DEFAULT_SCALE);
+    const [renderedScale, setRenderedScale] = useState<number>(DEFAULT_SCALE);
+    const [autoFit, setAutoFit] = useState<boolean>(() => shouldAutoFit());
+    const [viewerWidth, setViewerWidth] = useState(0);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [pageInput, setPageInput] = useState<string>(
@@ -70,10 +196,51 @@ export default function BooksReader({ book, bookmarks }: Props) {
     );
 
     const [panelOpen, setPanelOpen] = useState(false);
+    const [panelTab, setPanelTab] = useState<'toc' | 'bookmarks'>('toc');
+    const [toc, setToc] = useState<TocEntry[]>([]);
+    const [tocLoading, setTocLoading] = useState(true);
     const [savingBookmark, setSavingBookmark] = useState(false);
     const [isFullscreen, setIsFullscreen] = useState(false);
 
     const currentBookmark = bookmarks.find((b) => b.page === currentPage);
+
+    /**
+     * Сохраняем прогресс обычным fetch с keepalive: страница не перезагружается,
+     * запрос доживёт до закрытия вкладки. Сервер отвечает 204.
+     */
+    const saveProgress = useCallback(
+        (page: number, pages?: number) => {
+            if (!book?.id || page < 1) return;
+
+            const token =
+                document.querySelector<HTMLMetaElement>(
+                    'meta[name="csrf-token"]',
+                )?.content ?? '';
+
+            const payload: Record<string, number | string> = {
+                current_page: page,
+            };
+            if (pages) payload.total_pages = pages;
+            if (token) payload._token = token;
+
+            fetch(progressRoute.url({ book: book.id }), {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Accept: 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    ...(token ? { 'X-CSRF-TOKEN': token } : {}),
+                },
+                body: JSON.stringify(payload),
+                credentials: 'same-origin',
+                keepalive: true,
+            }).catch(() => {
+                // Молча: прогресс не критичен для чтения.
+            });
+        },
+        [book?.id],
+    );
+
 
     // Загрузка PDF
     useEffect(() => {
@@ -89,24 +256,42 @@ export default function BooksReader({ book, bookmarks }: Props) {
                     url: book.file_url,
                     wasmUrl: `https://unpkg.com/pdfjs-dist@${pdfjsLib.version}/wasm/`,
                 }).promise;
-                if (cancelled) return;
+
+                if (cancelled) {
+                    pdf.destroy();
+                    return;
+                }
+
                 pdfDocRef.current = pdf;
                 setTotalPages(pdf.numPages);
 
                 if (book.total_pages !== pdf.numPages) {
-                    router.post(
-                        progressRoute.url({ book: book.id }),
-                        {
-                            current_page: currentPage,
-                            total_pages: pdf.numPages,
-                        },
-                        { preserveScroll: true, preserveState: true },
-                    );
+                    saveProgress(currentPageRef.current, pdf.numPages);
                 }
+
+                // Оглавление строим после того, как книга уже открылась:
+                // большие PDF не должны ждать резолва всех destination.
+                pdf.getOutline()
+                    .then(async (outline: any[] | null) => {
+                        if (cancelled) return;
+                        if (!outline?.length) {
+                            setToc([]);
+                            return;
+                        }
+                        const entries = await buildToc(pdf, outline);
+                        if (!cancelled) setToc(entries);
+                    })
+                    .catch((e: unknown) => {
+                        console.warn('TOC error:', e);
+                    })
+                    .finally(() => {
+                        if (!cancelled) setTocLoading(false);
+                    });
             } catch (e) {
                 if (cancelled) return;
                 console.error('PDF load error:', e);
                 setError('Не удалось загрузить PDF.');
+                setTocLoading(false);
             } finally {
                 if (!cancelled) setIsLoading(false);
             }
@@ -114,6 +299,13 @@ export default function BooksReader({ book, bookmarks }: Props) {
 
         return () => {
             cancelled = true;
+            const pdf = pdfDocRef.current;
+            pdfDocRef.current = null;
+            try {
+                pdf?.destroy?.();
+            } catch {
+                // ignore
+            }
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [book?.file_url, book?.id]);
@@ -124,9 +316,29 @@ export default function BooksReader({ book, bookmarks }: Props) {
             const canvas = canvasRef.current;
             if (!pdf || !canvas) return;
 
+            const renderId = ++renderIdRef.current;
+
             try {
                 const page = await pdf.getPage(pageNum);
-                const viewport = page.getViewport({ scale });
+                if (renderId !== renderIdRef.current) return;
+
+                const baseViewport = page.getViewport({ scale: 1 });
+                const availableWidth = Math.max(viewerWidth - 2, 120);
+                const fitScale = clamp(
+                    availableWidth / baseViewport.width,
+                    MIN_SCALE,
+                    MAX_SCALE,
+                );
+                const effectiveScale = autoFit ? fitScale : scale;
+                effectiveScaleRef.current = effectiveScale;
+                setRenderedScale(effectiveScale);
+
+                // Рисуем в физических пикселях, а на экране показываем
+                // логический размер — так текст остаётся резким на HiDPI.
+                const dpr = clamp(window.devicePixelRatio || 1, 1, 2.5);
+                const viewport = page.getViewport({
+                    scale: effectiveScale * dpr,
+                });
                 const ctx = canvas.getContext('2d');
                 if (!ctx) return;
 
@@ -138,8 +350,10 @@ export default function BooksReader({ book, bookmarks }: Props) {
                     }
                 }
 
-                canvas.width = viewport.width;
-                canvas.height = viewport.height;
+                canvas.width = Math.floor(viewport.width);
+                canvas.height = Math.floor(viewport.height);
+                canvas.style.width = `${Math.floor(baseViewport.width * effectiveScale)}px`;
+                canvas.style.height = `${Math.floor(baseViewport.height * effectiveScale)}px`;
 
                 const task = page.render({
                     canvasContext: ctx,
@@ -153,26 +367,82 @@ export default function BooksReader({ book, bookmarks }: Props) {
                 }
             }
         },
-        [scale],
+        [autoFit, scale, viewerWidth],
     );
 
     useEffect(() => {
         if (!isLoading && pdfDocRef.current) {
             renderPage(currentPage);
         }
-    }, [currentPage, scale, isLoading, renderPage]);
+    }, [currentPage, isLoading, renderPage]);
+
+    // Ширина области чтения: авто-вписывание и перерисовка при ресайзе/панели.
+    useEffect(() => {
+        const el = viewerRef.current;
+        if (!el) return;
+
+        const measure = () => {
+            const styles = window.getComputedStyle(el);
+            const padding =
+                (parseFloat(styles.paddingLeft) || 0) +
+                (parseFloat(styles.paddingRight) || 0);
+            setViewerWidth(Math.max(0, el.clientWidth - padding));
+        };
+
+        measure();
+        const observer = new ResizeObserver(measure);
+        observer.observe(el);
+        window.addEventListener('resize', measure);
+
+        return () => {
+            observer.disconnect();
+            window.removeEventListener('resize', measure);
+        };
+    }, []);
 
     useEffect(() => {
-        if (isLoading || !book?.id) return;
+        currentPageRef.current = currentPage;
+    }, [currentPage]);
+
+    // Дебаунс сохранения прогресса: без Inertia-запроса и перезагрузки props.
+    useEffect(() => {
+        if (!book?.id) return;
+        if (currentPage === lastSavedRef.current) return;
+
         const t = setTimeout(() => {
-            router.post(
-                progressRoute.url({ book: book.id }),
-                { current_page: currentPage },
-                { preserveScroll: true, preserveState: true },
-            );
-        }, 1500);
+            lastSavedRef.current = currentPage;
+            saveProgress(currentPage);
+        }, 800);
+
         return () => clearTimeout(t);
-    }, [currentPage, isLoading, book?.id]);
+    }, [currentPage, book?.id, saveProgress]);
+
+    // Досохраняем при уходе со страницы и в фоне вкладки.
+    useEffect(() => {
+        const flush = () => {
+            const page = currentPageRef.current;
+            if (!book?.id || page < 1) return;
+            if (page === lastSavedRef.current) return;
+            lastSavedRef.current = page;
+            saveProgress(page);
+        };
+
+        const onVisibilityChange = () => {
+            if (document.visibilityState === 'hidden') flush();
+        };
+
+        window.addEventListener('pagehide', flush);
+        document.addEventListener('visibilitychange', onVisibilityChange);
+
+        return () => {
+            window.removeEventListener('pagehide', flush);
+            document.removeEventListener(
+                'visibilitychange',
+                onVisibilityChange,
+            );
+            flush();
+        };
+    }, [book?.id, saveProgress]);
 
     useEffect(() => {
         setPageInput(String(currentPage));
@@ -227,7 +497,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
             if (e.touches.length === 2) {
                 touchStateRef.current = {
                     startDist: getDist(e.touches),
-                    startScale: scale,
+                    startScale: effectiveScaleRef.current,
                 };
             }
         };
@@ -237,10 +507,12 @@ export default function BooksReader({ book, bookmarks }: Props) {
                 e.preventDefault();
                 const ratio =
                     getDist(e.touches) / touchStateRef.current.startDist;
-                const newScale = Math.min(
-                    Math.max(0.5, touchStateRef.current.startScale * ratio),
-                    4,
+                const newScale = clamp(
+                    touchStateRef.current.startScale * ratio,
+                    MIN_SCALE,
+                    MAX_SCALE,
                 );
+                setAutoFit(false);
                 setScale(newScale);
             }
         };
@@ -260,7 +532,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
             el.removeEventListener('touchmove', onTouchMove);
             el.removeEventListener('touchend', onTouchEnd);
         };
-    }, [scale]);
+    }, []);
 
     const goToPage = (n: number) => {
         const clamped = Math.min(Math.max(1, n), totalPages || 1);
@@ -268,7 +540,25 @@ export default function BooksReader({ book, bookmarks }: Props) {
     };
 
     const zoom = (delta: number) => {
-        setScale((s) => Math.min(Math.max(0.5, s + delta), 4));
+        const base = autoFit ? effectiveScaleRef.current : scale;
+        setAutoFit(false);
+        setScale(clamp(base + delta, MIN_SCALE, MAX_SCALE));
+    };
+
+    const toggleAutoFit = () => {
+        if (autoFit) {
+            // Выключаем вписывание и возвращаем привычный масштаб для ПК,
+            // а не текущий «330 %», который получился из ширины окна.
+            setScale(DEFAULT_SCALE);
+            setAutoFit(false);
+        } else {
+            setAutoFit(true);
+        }
+    };
+
+    const openToc = () => {
+        setPanelTab('toc');
+        setPanelOpen(true);
     };
 
     const submitPageInput = () => {
@@ -319,6 +609,11 @@ export default function BooksReader({ book, bookmarks }: Props) {
         setPanelOpen(false);
     };
 
+    const goToTocEntry = (page: number) => {
+        goToPage(page);
+        if (window.innerWidth < 640) setPanelOpen(false);
+    };
+
     if (!book) {
         return (
             <>
@@ -340,26 +635,50 @@ export default function BooksReader({ book, bookmarks }: Props) {
             ? Math.round((currentPage / totalPages) * 100)
             : 0;
 
+    // В полноэкранном режиме прячем отдельную строку с названием и
+    // сжимаем тулбар примерно на 30 %, чтобы осталась одна полоска.
+    const compact = isFullscreen;
+    const toolbarIcon = compact ? 'h-3.5 w-3.5' : 'h-4 w-4';
+    const toolbarIconBtn = compact ? 'h-7 w-7' : 'h-8 w-8';
+    const toolbarSmBtn = compact
+        ? 'h-7 gap-1 px-1.5 text-xs sm:px-2'
+        : 'px-2 sm:px-3';
+    const toolbarDivider = compact
+        ? 'mx-0.5 h-4 w-px'
+        : 'mx-1 h-5 w-px sm:mx-2 sm:h-6';
+
     return (
         <>
             <Head title={book.title} />
 
-            <div className="flex h-[calc(100vh-3.5rem)] flex-col bg-stone-100 dark:bg-stone-950 sm:h-[calc(100vh-4rem)]">
+            <div
+                className={`flex flex-col bg-stone-100 dark:bg-stone-950 ${
+                    isFullscreen
+                        ? 'h-[100dvh]'
+                        : 'h-[calc(100vh-3.5rem)] sm:h-[calc(100vh-4rem)]'
+                }`}
+            >
                 {/* Тулбар */}
-                <div className="flex flex-wrap items-center gap-1.5 border-b border-border bg-card px-2 py-1.5 text-foreground sm:gap-3 sm:px-4 sm:py-2">
+                <div
+                    className={`flex items-center border-b border-border bg-card text-foreground ${
+                        compact
+                            ? 'flex-nowrap gap-1 overflow-x-auto px-1.5 py-1 [&>*]:shrink-0'
+                            : 'flex-wrap gap-1.5 px-2 py-1.5 sm:gap-3 sm:px-4 sm:py-2'
+                    }`}
+                >
                     <Button
                         variant="ghost"
                         size="sm"
                         asChild
-                        className="px-2 sm:px-3"
+                        className={toolbarSmBtn}
                     >
                         <Link href="/books">
-                            <ArrowLeft className="h-4 w-4 sm:mr-2" />
+                            <ArrowLeft className={toolbarIcon} />
                             <span className="hidden sm:inline">Назад</span>
                         </Link>
                     </Button>
 
-                    <div className="mx-1 h-5 w-px bg-border sm:mx-2 sm:h-6" />
+                    <div className={`${toolbarDivider} bg-border`} />
 
                     <div className="flex items-center gap-1 text-sm">
                         <Input
@@ -372,40 +691,65 @@ export default function BooksReader({ book, bookmarks }: Props) {
                                     (e.target as HTMLInputElement).blur();
                                 }
                             }}
-                            className="h-8 w-12 text-center text-xs sm:w-16 sm:text-sm"
+                            className={`text-center ${
+                                compact
+                                    ? 'h-7 w-11 text-xs'
+                                    : 'h-8 w-12 text-xs sm:w-16 sm:text-sm'
+                            }`}
                         />
-                        <span className="text-xs text-muted-foreground sm:text-sm">
+                        <span
+                            className={`text-muted-foreground ${
+                                compact
+                                    ? 'hidden text-xs sm:inline'
+                                    : 'text-xs sm:text-sm'
+                            }`}
+                        >
                             / {totalPages || '…'}
                         </span>
                     </div>
 
-                    <div className="mx-1 h-5 w-px bg-border sm:mx-2 sm:h-6" />
+                    <div className={`${toolbarDivider} bg-border`} />
 
                     <div className="flex items-center gap-1">
                         <Button
                             variant="outline"
                             size="icon"
-                            className="h-8 w-8"
+                            className={toolbarIconBtn}
                             onClick={() => zoom(-0.2)}
-                            disabled={scale <= 0.5}
+                            disabled={!autoFit && scale <= MIN_SCALE}
+                            title="Уменьшить"
                         >
-                            <ZoomOut className="h-4 w-4" />
+                            <ZoomOut className={toolbarIcon} />
                         </Button>
                         <span className="hidden min-w-[3rem] text-center text-xs text-muted-foreground sm:inline sm:text-sm">
-                            {Math.round(scale * 100)}%
+                            {Math.round(renderedScale * 100)}%
                         </span>
                         <Button
                             variant="outline"
                             size="icon"
-                            className="h-8 w-8"
+                            className={toolbarIconBtn}
                             onClick={() => zoom(0.2)}
-                            disabled={scale >= 4}
+                            disabled={!autoFit && scale >= MAX_SCALE}
+                            title="Увеличить"
                         >
-                            <ZoomIn className="h-4 w-4" />
+                            <ZoomIn className={toolbarIcon} />
+                        </Button>
+                        <Button
+                            variant={autoFit ? 'default' : 'outline'}
+                            size="icon"
+                            className={toolbarIconBtn}
+                            onClick={toggleAutoFit}
+                            title={
+                                autoFit
+                                    ? 'По ширине окна (включено)'
+                                    : 'Вписать по ширине'
+                            }
+                        >
+                            <MoveHorizontal className={toolbarIcon} />
                         </Button>
                     </div>
 
-                    <div className="mx-1 h-5 w-px bg-border sm:mx-2 sm:h-6" />
+                    <div className={`${toolbarDivider} bg-border`} />
 
                     <Button
                         variant={currentBookmark ? 'default' : 'outline'}
@@ -428,11 +772,26 @@ export default function BooksReader({ book, bookmarks }: Props) {
                     </Button>
 
                     <Button
+                        variant={
+                            panelOpen && panelTab === 'toc'
+                                ? 'default'
+                                : 'outline'
+                        }
+                        size="sm"
+                        className="px-2 sm:px-3"
+                        onClick={openToc}
+                        title="Оглавление"
+                    >
+                        <ListTree className="h-4 w-4 sm:mr-2" />
+                        <span className="hidden sm:inline">Оглавление</span>
+                    </Button>
+
+                    <Button
                         variant={panelOpen ? 'default' : 'outline'}
                         size="sm"
                         className="px-2 sm:px-3"
                         onClick={() => setPanelOpen(!panelOpen)}
-                        title="Панель закладок"
+                        title="Панель навигации"
                     >
                         {panelOpen ? (
                             <PanelRightClose className="h-4 w-4 sm:mr-2" />
@@ -552,6 +911,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
                         </Button>
 
                         <div
+                            ref={viewerRef}
                             className={`h-full overflow-auto p-2 transition-colors sm:p-4 ${readerThemes[theme].wrapper}`}
                         >
                             {error ? (
@@ -596,7 +956,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
                         <aside className="absolute inset-y-0 right-0 z-30 flex w-72 max-w-[85vw] shrink-0 flex-col border-l border-border bg-card sm:relative sm:inset-auto sm:max-w-none">
                             <div className="flex items-center justify-between border-b border-border px-4 py-2">
                                 <h2 className="text-sm font-semibold">
-                                    Закладки
+                                    Навигация
                                 </h2>
                                 <Button
                                     variant="ghost"
@@ -608,55 +968,112 @@ export default function BooksReader({ book, bookmarks }: Props) {
                                 </Button>
                             </div>
 
-                            <div className="flex-1 overflow-auto p-2">
-                                {bookmarks.length === 0 ? (
-                                    <div className="flex flex-col items-center justify-center gap-2 px-4 py-12 text-center text-sm text-muted-foreground">
-                                        <BookmarkIcon className="h-8 w-8 opacity-40" />
-                                        <p>Пока нет закладок</p>
-                                        <p className="text-xs">
-                                            Нажмите 🔖 в панели, чтобы
-                                            добавить
-                                        </p>
-                                    </div>
-                                ) : (
-                                    <ul className="space-y-1">
-                                        {bookmarks.map((bm) => (
-                                            <li
-                                                key={bm.id}
-                                                className="group flex items-start gap-2 rounded-md p-2 hover:bg-accent"
-                                            >
-                                                <button
-                                                    type="button"
-                                                    onClick={() =>
-                                                        goToBookmark(bm.page)
-                                                    }
-                                                    className="flex min-w-0 flex-1 flex-col items-start text-left"
-                                                >
-                                                    <span className="text-xs font-medium text-foreground">
-                                                        Стр. {bm.page}
-                                                    </span>
-                                                    {bm.label && (
-                                                        <span className="line-clamp-2 text-xs text-muted-foreground">
-                                                            {bm.label}
-                                                        </span>
-                                                    )}
-                                                </button>
-                                                <Button
-                                                    variant="ghost"
-                                                    size="icon"
-                                                    className="h-6 w-6 shrink-0 opacity-0 group-hover:opacity-100"
-                                                    onClick={() =>
-                                                        deleteBookmark(bm.id)
-                                                    }
-                                                    aria-label="Удалить закладку"
-                                                >
-                                                    <Trash2 className="h-3 w-3 text-destructive" />
-                                                </Button>
-                                            </li>
-                                        ))}
-                                    </ul>
-                                )}
+                            <div className="flex border-b border-border text-xs">
+                                <button
+                                    type="button"
+                                    onClick={() => setPanelTab('toc')}
+                                    className={`flex flex-1 items-center justify-center gap-1.5 px-2 py-2 transition-colors ${
+                                        panelTab === 'toc'
+                                            ? 'border-b-2 border-primary font-medium text-foreground'
+                                            : 'text-muted-foreground hover:text-foreground'
+                                    }`}
+                                >
+                                    <ListTree className="h-3.5 w-3.5" />
+                                    Оглавление
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setPanelTab('bookmarks')}
+                                    className={`flex flex-1 items-center justify-center gap-1.5 px-2 py-2 transition-colors ${
+                                        panelTab === 'bookmarks'
+                                            ? 'border-b-2 border-primary font-medium text-foreground'
+                                            : 'text-muted-foreground hover:text-foreground'
+                                    }`}
+                                >
+                                    <BookmarkIcon className="h-3.5 w-3.5" />
+                                    Закладки
+                                    {bookmarks.length > 0 && (
+                                        <span className="rounded-full bg-muted px-1.5 text-[10px]">
+                                            {bookmarks.length}
+                                        </span>
+                                    )}
+                                </button>
                             </div>
+
+                            {panelTab === 'toc' ? (
+                                <div className="flex-1 overflow-auto p-2">
+                                    {tocLoading ? (
+                                        <p className="px-4 py-10 text-center text-xs text-muted-foreground">
+                                            Загрузка оглавления…
+                                        </p>
+                                    ) : toc.length === 0 ? (
+                                        <div className="flex flex-col items-center justify-center gap-2 px-4 py-12 text-center text-sm text-muted-foreground">
+                                            <ListTree className="h-8 w-8 opacity-40" />
+                                            <p>В этом PDF нет оглавления</p>
+                                            <p className="text-xs">
+                                                Используйте номер страницы или
+                                                закладки
+                                            </p>
+                                        </div>
+                                    ) : (
+                                        <TocList
+                                            entries={toc}
+                                            currentPage={currentPage}
+                                            onSelect={goToTocEntry}
+                                        />
+                                    )}
+                                </div>
+                            ) : (
+                                <div className="flex-1 overflow-auto p-2">
+                                    {bookmarks.length === 0 ? (
+                                        <div className="flex flex-col items-center justify-center gap-2 px-4 py-12 text-center text-sm text-muted-foreground">
+                                            <BookmarkIcon className="h-8 w-8 opacity-40" />
+                                            <p>Пока нет закладок</p>
+                                            <p className="text-xs">
+                                                Нажмите 🔖 в панели, чтобы
+                                                добавить
+                                            </p>
+                                        </div>
+                                    ) : (
+                                        <ul className="space-y-1">
+                                            {bookmarks.map((bm) => (
+                                                <li
+                                                    key={bm.id}
+                                                    className="group flex items-start gap-2 rounded-md p-2 hover:bg-accent"
+                                                >
+                                                    <button
+                                                        type="button"
+                                                        onClick={() =>
+                                                            goToBookmark(bm.page)
+                                                        }
+                                                        className="flex min-w-0 flex-1 flex-col items-start text-left"
+                                                    >
+                                                        <span className="text-xs font-medium text-foreground">
+                                                            Стр. {bm.page}
+                                                        </span>
+                                                        {bm.label && (
+                                                            <span className="line-clamp-2 text-xs text-muted-foreground">
+                                                                {bm.label}
+                                                            </span>
+                                                        )}
+                                                    </button>
+                                                    <Button
+                                                        variant="ghost"
+                                                        size="icon"
+                                                        className="h-6 w-6 shrink-0 opacity-0 group-hover:opacity-100"
+                                                        onClick={() =>
+                                                            deleteBookmark(bm.id)
+                                                        }
+                                                        aria-label="Удалить закладку"
+                                                    >
+                                                        <Trash2 className="h-3 w-3 text-destructive" />
+                                                    </Button>
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    )}
+                                </div>
+                            )}
                         </aside>
                     )}
                 </div>

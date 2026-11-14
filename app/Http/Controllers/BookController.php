@@ -8,6 +8,7 @@ use App\Models\Book;
 use App\Models\Category;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
+use Illuminate\Http\Response as HttpResponse;
 use Illuminate\Support\Facades\Storage;
 use Inertia\Inertia;
 use Inertia\Response;
@@ -215,7 +216,7 @@ public function create(): Response
     /**
      * Обновить прогресс чтения (вызывается из pdf.js при перелистывании).
      */
-    public function updateProgress(Request $request, Book $book): RedirectResponse
+    public function updateProgress(Request $request, Book $book): HttpResponse
     {
         abort_if($book->user_id !== $request->user()->id, 403);
 
@@ -233,7 +234,8 @@ public function create(): Response
             $book->update(['total_pages' => $validated['total_pages']]);
         }
 
-        return back();
+        // Читалка сохраняет прогресс обычным fetch и не ждёт Inertia-ответа.
+        return response()->noContent();
     }
 
     public function destroy(Request $request, Book $book): RedirectResponse
