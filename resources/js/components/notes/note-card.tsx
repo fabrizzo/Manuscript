@@ -1,4 +1,4 @@
-import { Link2, Pencil, Trash2 } from 'lucide-react';
+import { Pencil, Trash2 } from 'lucide-react';
 import { noteKindMeta } from '@/components/notes/note-meta';
 import { Button } from '@/components/ui/button';
 import type { Note } from '@/types/note';
@@ -45,7 +45,7 @@ export function NoteCard({
             <button
                 type="button"
                 onClick={onOpen}
-                className="flex w-full flex-col gap-2 pr-12 text-left"
+                className="flex w-full flex-col gap-2 pr-16 text-left"
             >
                 <div className="flex flex-wrap items-center gap-1.5">
                     <span
@@ -97,41 +97,29 @@ export function NoteCard({
                 )}
             </button>
 
-            <div className="absolute top-1.5 right-1.5 flex items-center gap-0.5 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
-                {onOpen && (
-                    <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-6 w-6"
-                        onClick={onOpen}
-                        aria-label="Открыть страницу заметки"
-                        title="Открыть страницу"
-                    >
-                        <Link2 className="h-3 w-3" />
-                    </Button>
-                )}
+            <div className="absolute top-1.5 right-1.5 flex items-center gap-0.5">
                 {onEdit && (
                     <Button
                         variant="ghost"
                         size="icon"
-                        className="h-6 w-6"
+                        className="h-7 w-7"
                         onClick={onEdit}
                         aria-label="Редактировать заметку"
                         title="Редактировать"
                     >
-                        <Pencil className="h-3 w-3" />
+                        <Pencil className="h-3.5 w-3.5" />
                     </Button>
                 )}
                 {onDelete && (
                     <Button
                         variant="ghost"
                         size="icon"
-                        className="h-6 w-6"
+                        className="h-7 w-7"
                         onClick={onDelete}
                         aria-label="Удалить заметку"
                         title="Удалить"
                     >
-                        <Trash2 className="h-3 w-3 text-destructive" />
+                        <Trash2 className="h-3.5 w-3.5 text-destructive" />
                     </Button>
                 )}
             </div>

@@ -373,7 +373,7 @@ export default function NotesIndex({
                 )}
             </div>
 
-            {editingNote?.book && (
+            {editingNote && editingNote.book ? (
                 <NoteComposer
                     open={composerOpen}
                     onOpenChange={setComposerOpen}
@@ -385,7 +385,11 @@ export default function NotesIndex({
                     note={editingNote}
                     onSaved={reloadNotes}
                 />
-            )}
+            ) : null}
         </>
     );
 }
+
+NotesIndex.layout = {
+    breadcrumbs: [{ title: 'Заметки', href: '/notes' }],
+};

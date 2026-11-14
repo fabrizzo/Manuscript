@@ -137,6 +137,9 @@ class NoteController extends Controller
     {
         $request->merge([
             'body' => trim((string) $request->input('body', '')),
+            'section' => $request->filled('section')
+                ? mb_substr(trim((string) $request->input('section')), 0, 255)
+                : null,
         ]);
 
         $validated = $request->validate([

@@ -98,6 +98,12 @@ export function NoteComposer({
         const text = body.trim();
         if (!text || saving) return;
 
+        const pendingTag = normalizeTag(tagInput);
+        const finalTags =
+            pendingTag && !tags.includes(pendingTag) && tags.length < 8
+                ? [...tags, pendingTag]
+                : tags;
+
         setSaving(true);
         setError(null);
 
@@ -123,7 +129,7 @@ export function NoteComposer({
                     page: effectivePage,
                     kind,
                     body: text,
-                    tags,
+                    tags: finalTags,
                     section: effectiveSection,
                 }),
                 credentials: 'same-origin',
@@ -155,7 +161,7 @@ export function NoteComposer({
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent
-                className="max-sm:top-auto max-sm:bottom-0 max-sm:max-w-none max-sm:translate-y-0 max-sm:rounded-b-none max-sm:rounded-t-2xl sm:max-w-xl"
+                className="max-sm:top-auto max-sm:bottom-0 max-sm:max-h-[92dvh] max-sm:max-w-none max-sm:translate-y-0 max-sm:overflow-y-auto max-sm:rounded-b-none max-sm:rounded-t-2xl max-sm:pb-[calc(1.5rem_+_env(safe-area-inset-bottom))] sm:max-w-xl"
                 onOpenAutoFocus={(event) => {
                     event.preventDefault();
                     textareaRef.current?.focus();
@@ -169,7 +175,7 @@ export function NoteComposer({
                         <span className="font-medium text-foreground">
                             {bookTitle}
                         </span>
-                        <span>· стр. {effectivePage}</span>
+                        <span> · стр. {effectivePage}</span>
                         {effectiveSection && (
                             <span className="line-clamp-1 max-w-full">
                                 · {effectiveSection}
