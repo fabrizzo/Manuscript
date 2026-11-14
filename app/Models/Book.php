@@ -38,6 +38,13 @@ class Book extends Model
         return $this->hasMany(Bookmark::class)->orderBy('page');
     }
 
+    public function notes(): HasMany
+    {
+        return $this->hasMany(Note::class)
+            ->orderBy('page')
+            ->orderByDesc('created_at');
+    }
+
     public function progress(): HasOne
     {
         return $this->hasOne(ReadingProgress::class);

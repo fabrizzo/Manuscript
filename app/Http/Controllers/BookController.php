@@ -198,6 +198,32 @@ public function create(): Response
     {
         abort_if($book->user_id !== $request->user()->id, 403);
 
+        $initialPage = (int) $request->query(
+            'page',
+            $book->progress?->current_page ?? 1,
+        );
+        $initialPage = max(1, $initialPage);
+        if ($book->total_pages) {
+            $initialPage = min($initialPage, $book->total_pages);
+        }
+
+        $tagSuggestions = \App\Models\Note::query()
+            ->whereHas('book', fn ($query) => $query->where('user_id', $request->user()->id))
+            ->get(['tags'])
+            ->pluck('tags')
+            ->flatten()
+            ->filter()
+            ->map(fn ($tag) => (string) $tag)
+            ->countBy()
+            ->sortDesc()
+            ->take(24)
+            ->keys()
+            ->values();
+
+        if ($book->category?->name && ! $tagSuggestions->contains($book->category->name)) {
+            $tagSuggestions->prepend($book->category->name);
+        }
+
         return Inertia::render('books/reader', [
             'book' => [
                 'id' => $book->id,
@@ -209,7 +235,21 @@ public function create(): Response
                 'total_pages' => $book->total_pages,
                 'current_page' => $book->progress?->current_page ?? 1,
             ],
+            'initialPage' => $initialPage,
             'bookmarks' => $book->bookmarks()->get(['id', 'page', 'label']),
+            'notes' => $book->notes()
+                ->get(['id', 'page', 'kind', 'body', 'tags', 'section', 'created_at', 'updated_at'])
+                ->map(fn ($note) => [
+                    'id' => $note->id,
+                    'page' => $note->page,
+                    'kind' => $note->kind,
+                    'body' => $note->body,
+                    'tags' => $note->tags ?? [],
+                    'section' => $note->section,
+                    'created_at' => $note->created_at?->toIso8601String(),
+                    'updated_at' => $note->updated_at?->toIso8601String(),
+                ]),
+            'tagSuggestions' => $tagSuggestions,
         ]);
     }
 

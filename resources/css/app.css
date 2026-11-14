@@ -152,6 +152,12 @@ html.reader-fullscreen [data-slot="app-header"] {
     display: none !important;
 }
 
+/* В полноэкранном режиме страница не должна прокручиваться сама */
+html.reader-fullscreen,
+html.reader-fullscreen body {
+    overflow: hidden !important;
+}
+
 /* Контент приложения растягиваем на весь экран */
 html.reader-fullscreen [data-slot="sidebar-inset"] {
     margin: 0 !important;

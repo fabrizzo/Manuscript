@@ -9,16 +9,21 @@ import {
     Maximize2,
     Minimize2,
     MoveHorizontal,
+    NotebookPen,
     Palette,
     PanelRightClose,
     PanelRightOpen,
+    Plus,
     Trash2,
     ZoomIn,
     ZoomOut,
 } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { toast } from 'sonner';
+import { NoteCard } from '@/components/notes/note-card';
+import { NoteComposer } from '@/components/notes/note-composer';
 import { Button } from '@/components/ui/button';
 import {
     DropdownMenu,
@@ -35,6 +40,7 @@ import {
     type ReaderTheme,
 } from '@/hooks/use-reader-theme';
 import type { BookReader, Bookmark } from '@/types/book';
+import type { Note } from '@/types/note';
 import { progress as progressRoute } from '@/routes/books';
 import {
     store as bookmarkStore,
@@ -45,7 +51,10 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 type Props = {
     book: BookReader;
+    initialPage: number;
     bookmarks: Bookmark[];
+    notes: Note[];
+    tagSuggestions: string[];
 };
 
 type TocEntry = {
@@ -60,6 +69,7 @@ const clamp = (value: number, min: number, max: number) =>
 const MIN_SCALE = 0.2;
 const MAX_SCALE = 4;
 const DEFAULT_SCALE = 1.4;
+const ZOOM_STEP = 0.05;
 
 /**
  * На ПК по умолчанию читаем в ручном масштабе (140 %), на телефонах
@@ -164,14 +174,24 @@ function TocList({
     );
 }
 
-export default function BooksReader({ book, bookmarks }: Props) {
+const sortNotes = (items: Note[]) =>
+    [...items].sort((a, b) => a.page - b.page || b.id - a.id);
+
+export default function BooksReader({
+    book,
+    initialPage,
+    bookmarks,
+    notes: initialNotes,
+    tagSuggestions,
+}: Props) {
+    const startPage = Math.max(1, initialPage || book?.current_page || 1);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const viewerRef = useRef<HTMLDivElement>(null);
     const pdfDocRef = useRef<any>(null);
     const renderTaskRef = useRef<any>(null);
     const renderIdRef = useRef(0);
     const effectiveScaleRef = useRef(1.4);
-    const currentPageRef = useRef<number>(book?.current_page || 1);
+    const currentPageRef = useRef<number>(startPage);
     const lastSavedRef = useRef<number>(book?.current_page || 0);
     const touchStateRef = useRef<{
         startDist: number;
@@ -181,9 +201,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
     const [totalPages, setTotalPages] = useState<number>(
         book?.total_pages ?? 0,
     );
-    const [currentPage, setCurrentPage] = useState<number>(
-        book?.current_page || 1,
-    );
+    const [currentPage, setCurrentPage] = useState<number>(startPage);
     const { theme, setTheme } = useReaderTheme();
     const [scale, setScale] = useState<number>(DEFAULT_SCALE);
     const [renderedScale, setRenderedScale] = useState<number>(DEFAULT_SCALE);
@@ -191,18 +209,66 @@ export default function BooksReader({ book, bookmarks }: Props) {
     const [viewerWidth, setViewerWidth] = useState(0);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
-    const [pageInput, setPageInput] = useState<string>(
-        String(book?.current_page || 1),
-    );
+    const [pageInput, setPageInput] = useState<string>(String(startPage));
 
     const [panelOpen, setPanelOpen] = useState(false);
-    const [panelTab, setPanelTab] = useState<'toc' | 'bookmarks'>('toc');
+    const [panelTab, setPanelTab] = useState<'toc' | 'bookmarks' | 'notes'>(
+        'toc',
+    );
     const [toc, setToc] = useState<TocEntry[]>([]);
     const [tocLoading, setTocLoading] = useState(true);
     const [savingBookmark, setSavingBookmark] = useState(false);
     const [isFullscreen, setIsFullscreen] = useState(false);
 
+    const [notes, setNotes] = useState<Note[]>(() =>
+        sortNotes(initialNotes ?? []),
+    );
+    const [noteComposerOpen, setNoteComposerOpen] = useState(false);
+    const [editingNote, setEditingNote] = useState<Note | null>(null);
+
     const currentBookmark = bookmarks.find((b) => b.page === currentPage);
+
+    const currentSection = useMemo(() => {
+        const flat: TocEntry[] = [];
+        const walk = (items: TocEntry[]) => {
+            for (const item of items) {
+                flat.push(item);
+                walk(item.children);
+            }
+        };
+        walk(toc);
+
+        let title: string | null = null;
+        let page = 0;
+        for (const entry of flat) {
+            if (
+                entry.page &&
+                entry.page <= currentPage &&
+                entry.page >= page
+            ) {
+                page = entry.page;
+                title = entry.title;
+            }
+        }
+
+        return title;
+    }, [toc, currentPage]);
+
+    const groupedNotes = useMemo(() => {
+        const groups = new Map<number, Note[]>();
+        for (const note of notes) {
+            const list = groups.get(note.page);
+            if (list) {
+                list.push(note);
+            } else {
+                groups.set(note.page, [note]);
+            }
+        }
+
+        return [...groups.entries()].sort((a, b) => a[0] - b[0]);
+    }, [notes]);
+
+    const noteCount = notes.length;
 
     /**
      * Сохраняем прогресс обычным fetch с keepalive: страница не перезагружается,
@@ -448,7 +514,16 @@ export default function BooksReader({ book, bookmarks }: Props) {
         setPageInput(String(currentPage));
     }, [currentPage]);
 
-    // Клавиатура
+    const zoom = useCallback(
+        (delta: number) => {
+            const base = autoFit ? effectiveScaleRef.current : scale;
+            setAutoFit(false);
+            setScale(clamp(base + delta, MIN_SCALE, MAX_SCALE));
+        },
+        [autoFit, scale],
+    );
+
+    // Клавиатура: ←/→ — страницы, ↑/↓ — масштаб с шагом 5 %
     useEffect(() => {
         const onKey = (e: KeyboardEvent) => {
             if (e.target instanceof HTMLInputElement) return;
@@ -458,11 +533,17 @@ export default function BooksReader({ book, bookmarks }: Props) {
                 setCurrentPage((p) =>
                     totalPages ? Math.min(totalPages, p + 1) : p + 1,
                 );
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                zoom(ZOOM_STEP);
+            } else if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                zoom(-ZOOM_STEP);
             }
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, [totalPages]);
+    }, [totalPages, zoom]);
 
     // Fullscreen
     useEffect(() => {
@@ -539,12 +620,6 @@ export default function BooksReader({ book, bookmarks }: Props) {
         setCurrentPage(clamped);
     };
 
-    const zoom = (delta: number) => {
-        const base = autoFit ? effectiveScaleRef.current : scale;
-        setAutoFit(false);
-        setScale(clamp(base + delta, MIN_SCALE, MAX_SCALE));
-    };
-
     const toggleAutoFit = () => {
         if (autoFit) {
             // Выключаем вписывание и возвращаем привычный масштаб для ПК,
@@ -614,6 +689,104 @@ export default function BooksReader({ book, bookmarks }: Props) {
         if (window.innerWidth < 640) setPanelOpen(false);
     };
 
+    const openNoteComposer = useCallback(() => {
+        setEditingNote(null);
+        setPanelTab('notes');
+        setPanelOpen(true);
+        setNoteComposerOpen(true);
+    }, []);
+
+    const editNote = (note: Note) => {
+        setEditingNote(note);
+        setPanelTab('notes');
+        setPanelOpen(true);
+        setNoteComposerOpen(true);
+    };
+
+    const handleNoteSaved = (saved: Note) => {
+        setNotes((prev) => {
+            const exists = prev.some((note) => note.id === saved.id);
+            return sortNotes(
+                exists
+                    ? prev.map((note) =>
+                          note.id === saved.id ? { ...note, ...saved } : note,
+                      )
+                    : [...prev, saved],
+            );
+        });
+        setEditingNote(null);
+    };
+
+    const deleteNote = async (note: Note) => {
+        if (!book?.id) return;
+        if (!window.confirm('Удалить заметку? Это действие нельзя отменить.')) {
+            return;
+        }
+
+        const token =
+            document.querySelector<HTMLMetaElement>(
+                'meta[name="csrf-token"]',
+            )?.content ?? '';
+
+        try {
+            const response = await fetch(
+                `/books/${book.id}/notes/${note.id}`,
+                {
+                    method: 'DELETE',
+                    headers: {
+                        Accept: 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        ...(token ? { 'X-CSRF-TOKEN': token } : {}),
+                    },
+                    credentials: 'same-origin',
+                },
+            );
+
+            if (!response.ok) throw new Error('Не удалось удалить заметку');
+
+            setNotes((prev) => prev.filter((item) => item.id !== note.id));
+            toast.success('Заметка удалена');
+        } catch (e) {
+            toast.error(
+                e instanceof Error ? e.message : 'Не удалось удалить заметку',
+            );
+        }
+    };
+
+    const goToNote = (note: Note) => {
+        goToPage(note.page);
+        if (window.innerWidth < 640) setPanelOpen(false);
+    };
+
+    useEffect(() => {
+        const onKey = (event: KeyboardEvent) => {
+            if (noteComposerOpen) return;
+            if (event.metaKey || event.ctrlKey || event.altKey) return;
+
+            const target = event.target as HTMLElement | null;
+            if (
+                target instanceof HTMLInputElement ||
+                target instanceof HTMLTextAreaElement ||
+                target?.isContentEditable
+            ) {
+                return;
+            }
+
+            if (
+                event.key === 'n' ||
+                event.key === 'N' ||
+                event.key === 'т' ||
+                event.key === 'Т'
+            ) {
+                event.preventDefault();
+                openNoteComposer();
+            }
+        };
+
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [noteComposerOpen, openNoteComposer]);
+
     if (!book) {
         return (
             <>
@@ -652,10 +825,10 @@ export default function BooksReader({ book, bookmarks }: Props) {
             <Head title={book.title} />
 
             <div
-                className={`flex flex-col bg-stone-100 dark:bg-stone-950 ${
+                className={`flex flex-none flex-col overflow-hidden bg-stone-100 dark:bg-stone-950 ${
                     isFullscreen
                         ? 'h-[100dvh]'
-                        : 'h-[calc(100vh-3.5rem)] sm:h-[calc(100vh-4rem)]'
+                        : 'h-[calc(100svh-4rem)] md:h-[calc(100svh-5rem)]'
                 }`}
             >
                 {/* Тулбар */}
@@ -715,9 +888,9 @@ export default function BooksReader({ book, bookmarks }: Props) {
                             variant="outline"
                             size="icon"
                             className={toolbarIconBtn}
-                            onClick={() => zoom(-0.2)}
+                            onClick={() => zoom(-ZOOM_STEP)}
                             disabled={!autoFit && scale <= MIN_SCALE}
-                            title="Уменьшить"
+                            title="Уменьшить (↓)"
                         >
                             <ZoomOut className={toolbarIcon} />
                         </Button>
@@ -728,9 +901,9 @@ export default function BooksReader({ book, bookmarks }: Props) {
                             variant="outline"
                             size="icon"
                             className={toolbarIconBtn}
-                            onClick={() => zoom(0.2)}
+                            onClick={() => zoom(ZOOM_STEP)}
                             disabled={!autoFit && scale >= MAX_SCALE}
-                            title="Увеличить"
+                            title="Увеличить (↑)"
                         >
                             <ZoomIn className={toolbarIcon} />
                         </Button>
@@ -754,7 +927,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
                     <Button
                         variant={currentBookmark ? 'default' : 'outline'}
                         size="sm"
-                        className="px-2 sm:px-3"
+                        className={toolbarSmBtn}
                         onClick={addBookmark}
                         disabled={savingBookmark}
                         title={
@@ -764,11 +937,35 @@ export default function BooksReader({ book, bookmarks }: Props) {
                         }
                     >
                         {currentBookmark ? (
-                            <BookmarkIcon className="h-4 w-4 fill-current sm:mr-2" />
+                            <BookmarkIcon
+                                className={`${toolbarIcon} fill-current sm:mr-1`}
+                            />
                         ) : (
-                            <BookmarkPlus className="h-4 w-4 sm:mr-2" />
+                            <BookmarkPlus
+                                className={`${toolbarIcon} sm:mr-1`}
+                            />
                         )}
                         <span className="hidden sm:inline">Закладка</span>
+                    </Button>
+
+                    <Button
+                        variant={
+                            panelOpen && panelTab === 'notes'
+                                ? 'default'
+                                : 'outline'
+                        }
+                        size="sm"
+                        className={toolbarSmBtn}
+                        onClick={openNoteComposer}
+                        title="Добавить заметку (N)"
+                    >
+                        <NotebookPen className={`${toolbarIcon} sm:mr-1`} />
+                        <span className="hidden sm:inline">Заметка</span>
+                        {noteCount > 0 && (
+                            <span className="ml-1 hidden rounded-full bg-muted px-1.5 text-[10px] text-foreground sm:inline">
+                                {noteCount}
+                            </span>
+                        )}
                     </Button>
 
                     <Button
@@ -778,25 +975,29 @@ export default function BooksReader({ book, bookmarks }: Props) {
                                 : 'outline'
                         }
                         size="sm"
-                        className="px-2 sm:px-3"
+                        className={toolbarSmBtn}
                         onClick={openToc}
                         title="Оглавление"
                     >
-                        <ListTree className="h-4 w-4 sm:mr-2" />
+                        <ListTree className={`${toolbarIcon} sm:mr-1`} />
                         <span className="hidden sm:inline">Оглавление</span>
                     </Button>
 
                     <Button
                         variant={panelOpen ? 'default' : 'outline'}
                         size="sm"
-                        className="px-2 sm:px-3"
+                        className={toolbarSmBtn}
                         onClick={() => setPanelOpen(!panelOpen)}
                         title="Панель навигации"
                     >
                         {panelOpen ? (
-                            <PanelRightClose className="h-4 w-4 sm:mr-2" />
+                            <PanelRightClose
+                                className={`${toolbarIcon} sm:mr-1`}
+                            />
                         ) : (
-                            <PanelRightOpen className="h-4 w-4 sm:mr-2" />
+                            <PanelRightOpen
+                                className={`${toolbarIcon} sm:mr-1`}
+                            />
                         )}
                         <span className="hidden sm:inline">Панель</span>
                         {bookmarks.length > 0 && (
@@ -811,10 +1012,10 @@ export default function BooksReader({ book, bookmarks }: Props) {
                             <Button
                                 variant="outline"
                                 size="sm"
-                                className="px-2 sm:px-3"
+                                className={toolbarSmBtn}
                                 title="Цвет фона"
                             >
-                                <Palette className="h-4 w-4 sm:mr-2" />
+                                <Palette className={`${toolbarIcon} sm:mr-1`} />
                                 <span className="hidden sm:inline">Фон</span>
                             </Button>
                         </DropdownMenuTrigger>
@@ -850,7 +1051,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
                     <Button
                         variant="outline"
                         size="icon"
-                        className="h-8 w-8"
+                        className={toolbarIconBtn}
                         onClick={toggleFullscreen}
                         title={
                             isFullscreen
@@ -859,28 +1060,30 @@ export default function BooksReader({ book, bookmarks }: Props) {
                         }
                     >
                         {isFullscreen ? (
-                            <Minimize2 className="h-4 w-4" />
+                            <Minimize2 className={toolbarIcon} />
                         ) : (
-                            <Maximize2 className="h-4 w-4" />
+                            <Maximize2 className={toolbarIcon} />
                         )}
                     </Button>
                 </div>
 
-                {/* Название книги */}
-                <div className="border-b border-border bg-card px-3 py-1.5 sm:px-4 sm:py-2">
-                    <p className="truncate text-center text-xs font-medium text-foreground sm:text-sm">
-                        {book.title}
-                        {book.author && (
-                            <span className="text-muted-foreground">
-                                {' '}
-                                — {book.author}
-                            </span>
-                        )}
-                    </p>
-                </div>
+                {/* Название книги (в полном экране скрыто — остаётся одна полоска) */}
+                {!isFullscreen && (
+                    <div className="border-b border-border bg-card px-3 py-1.5 sm:px-4 sm:py-2">
+                        <p className="truncate text-center text-xs font-medium text-foreground sm:text-sm">
+                            {book.title}
+                            {book.author && (
+                                <span className="text-muted-foreground">
+                                    {' '}
+                                    — {book.author}
+                                </span>
+                            )}
+                        </p>
+                    </div>
+                )}
 
                 {/* Основная область */}
-                <div className="flex flex-1 overflow-hidden">
+                <div className="flex min-h-0 flex-1 overflow-hidden">
                     <div className="relative flex-1 overflow-hidden">
                         {/* Левая кнопка */}
                         <Button
@@ -912,7 +1115,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
 
                         <div
                             ref={viewerRef}
-                            className={`h-full overflow-auto p-2 transition-colors sm:p-4 ${readerThemes[theme].wrapper}`}
+                            className={`h-full overflow-auto transition-colors ${compact ? 'p-1 sm:p-2' : 'p-2 sm:p-4'} ${readerThemes[theme].wrapper}`}
                         >
                             {error ? (
                                 <div className="mx-auto max-w-lg rounded-lg border border-border bg-card p-6 text-center">
@@ -930,7 +1133,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
                                     </Button>
                                 </div>
                             ) : (
-                                <div className="flex justify-center">
+                                <div className="flex w-max min-w-full justify-center">
                                     <canvas
                                         ref={canvasRef}
                                         className={`rounded border bg-white shadow-lg ${readerThemes[theme].canvasBorder}`}
@@ -953,7 +1156,13 @@ export default function BooksReader({ book, bookmarks }: Props) {
 
                     {/* Правая панель с закладками */}
                     {panelOpen && (
-                        <aside className="absolute inset-y-0 right-0 z-30 flex w-72 max-w-[85vw] shrink-0 flex-col border-l border-border bg-card sm:relative sm:inset-auto sm:max-w-none">
+                        <aside
+                            className={`absolute inset-y-0 right-0 z-30 flex max-w-[85vw] shrink-0 flex-col border-l border-border bg-card sm:relative sm:inset-auto sm:max-w-none ${
+                                panelTab === 'notes'
+                                    ? 'w-80 sm:w-96'
+                                    : 'w-72'
+                            }`}
+                        >
                             <div className="flex items-center justify-between border-b border-border px-4 py-2">
                                 <h2 className="text-sm font-semibold">
                                     Навигация
@@ -972,19 +1181,19 @@ export default function BooksReader({ book, bookmarks }: Props) {
                                 <button
                                     type="button"
                                     onClick={() => setPanelTab('toc')}
-                                    className={`flex flex-1 items-center justify-center gap-1.5 px-2 py-2 transition-colors ${
+                                    className={`flex flex-1 items-center justify-center gap-1 px-1.5 py-2 transition-colors ${
                                         panelTab === 'toc'
                                             ? 'border-b-2 border-primary font-medium text-foreground'
                                             : 'text-muted-foreground hover:text-foreground'
                                     }`}
                                 >
                                     <ListTree className="h-3.5 w-3.5" />
-                                    Оглавление
+                                    Главы
                                 </button>
                                 <button
                                     type="button"
                                     onClick={() => setPanelTab('bookmarks')}
-                                    className={`flex flex-1 items-center justify-center gap-1.5 px-2 py-2 transition-colors ${
+                                    className={`flex flex-1 items-center justify-center gap-1 px-1.5 py-2 transition-colors ${
                                         panelTab === 'bookmarks'
                                             ? 'border-b-2 border-primary font-medium text-foreground'
                                             : 'text-muted-foreground hover:text-foreground'
@@ -995,6 +1204,23 @@ export default function BooksReader({ book, bookmarks }: Props) {
                                     {bookmarks.length > 0 && (
                                         <span className="rounded-full bg-muted px-1.5 text-[10px]">
                                             {bookmarks.length}
+                                        </span>
+                                    )}
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setPanelTab('notes')}
+                                    className={`flex flex-1 items-center justify-center gap-1 px-1.5 py-2 transition-colors ${
+                                        panelTab === 'notes'
+                                            ? 'border-b-2 border-primary font-medium text-foreground'
+                                            : 'text-muted-foreground hover:text-foreground'
+                                    }`}
+                                >
+                                    <NotebookPen className="h-3.5 w-3.5" />
+                                    Заметки
+                                    {noteCount > 0 && (
+                                        <span className="rounded-full bg-muted px-1.5 text-[10px]">
+                                            {noteCount}
                                         </span>
                                     )}
                                 </button>
@@ -1023,7 +1249,7 @@ export default function BooksReader({ book, bookmarks }: Props) {
                                         />
                                     )}
                                 </div>
-                            ) : (
+                            ) : panelTab === 'bookmarks' ? (
                                 <div className="flex-1 overflow-auto p-2">
                                     {bookmarks.length === 0 ? (
                                         <div className="flex flex-col items-center justify-center gap-2 px-4 py-12 text-center text-sm text-muted-foreground">
@@ -1073,14 +1299,123 @@ export default function BooksReader({ book, bookmarks }: Props) {
                                         </ul>
                                     )}
                                 </div>
+                            ) : (
+                                <div className="flex min-h-0 flex-1 flex-col">
+                                    <div className="border-b border-border p-2">
+                                        <Button
+                                            className="w-full justify-start gap-2"
+                                            onClick={openNoteComposer}
+                                        >
+                                            <Plus className="h-4 w-4" />
+                                            Добавить заметку
+                                            <kbd className="ml-auto rounded border border-border bg-muted px-1.5 py-0.5 text-[10px] font-normal text-muted-foreground">
+                                                N
+                                            </kbd>
+                                        </Button>
+                                    </div>
+
+                                    <div className="flex-1 overflow-auto p-2">
+                                        {notes.length === 0 ? (
+                                            <div className="flex flex-col items-center justify-center gap-2 px-4 py-12 text-center text-sm text-muted-foreground">
+                                                <NotebookPen className="h-8 w-8 opacity-40" />
+                                                <p>Пока нет заметок</p>
+                                                <p className="text-xs">
+                                                    Записывайте мысли, цитаты и
+                                                    вопросы — они останутся
+                                                    здесь.
+                                                </p>
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-3">
+                                                {groupedNotes.map(
+                                                    ([page, pageNotes]) => (
+                                                        <div key={page}>
+                                                            <div className="sticky top-0 z-10 -mx-2 mb-1 flex items-center gap-2 bg-card/95 px-3 py-1.5 backdrop-blur">
+                                                                <span className="text-[11px] font-semibold text-foreground">
+                                                                    Стр. {page}
+                                                                </span>
+                                                                {pageNotes[0]
+                                                                    .section && (
+                                                                    <span className="truncate text-[10px] text-muted-foreground">
+                                                                        {
+                                                                            pageNotes[0]
+                                                                                .section
+                                                                        }
+                                                                    </span>
+                                                                )}
+                                                                <span className="ml-auto text-[10px] text-muted-foreground">
+                                                                    {
+                                                                        pageNotes.length
+                                                                    }
+                                                                </span>
+                                                            </div>
+                                                            <div className="space-y-1.5">
+                                                                {pageNotes.map(
+                                                                    (note) => (
+                                                                        <NoteCard
+                                                                            key={
+                                                                                note.id
+                                                                            }
+                                                                            note={
+                                                                                note
+                                                                            }
+                                                                            compact
+                                                                            hidePage
+                                                                            onOpen={() =>
+                                                                                goToNote(
+                                                                                    note,
+                                                                                )
+                                                                            }
+                                                                            onEdit={() =>
+                                                                                editNote(
+                                                                                    note,
+                                                                                )
+                                                                            }
+                                                                            onDelete={() =>
+                                                                                void deleteNote(
+                                                                                    note,
+                                                                                )
+                                                                            }
+                                                                        />
+                                                                    ),
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    ),
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    <div className="border-t border-border p-1.5">
+                                        <Link
+                                            href="/notes"
+                                            className="block rounded-md px-2 py-1.5 text-center text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                                        >
+                                            Все заметки →
+                                        </Link>
+                                    </div>
+                                </div>
                             )}
                         </aside>
                     )}
                 </div>
 
                 {/* Нижняя панель прогресса */}
-                <div className="border-t border-border bg-card px-3 py-0.5 sm:px-4 sm:py-1">
-                    <div className="flex items-center gap-1.5 text-[10px] sm:gap-2 sm:text-xs">
+                <div
+                    className={`border-t border-border bg-card ${
+                        compact
+                            ? 'px-2 py-0 pb-[env(safe-area-inset-bottom)]'
+                            : 'px-3 py-0.5 sm:px-4 sm:py-1'
+                    }`}
+                >
+                    <div
+                        className={`flex items-center ${
+                            compact
+                                ? 'gap-1.5 text-[10px]'
+                                : 'gap-1.5 text-[10px] sm:gap-2 sm:text-xs'
+                        }`}
+                    >
                         <span className="min-w-[70px] whitespace-nowrap text-muted-foreground sm:min-w-[90px]">
                             Стр.{' '}
                             <span className="font-medium text-foreground">
@@ -1100,6 +1435,21 @@ export default function BooksReader({ book, bookmarks }: Props) {
                     </div>
                 </div>
             </div>
+
+            <NoteComposer
+                open={noteComposerOpen}
+                onOpenChange={(open) => {
+                    setNoteComposerOpen(open);
+                    if (!open) setEditingNote(null);
+                }}
+                bookId={book.id}
+                bookTitle={book.title}
+                page={currentPage}
+                section={currentSection}
+                suggestedTags={tagSuggestions}
+                note={editingNote}
+                onSaved={handleNoteSaved}
+            />
         </>
     );
 }
